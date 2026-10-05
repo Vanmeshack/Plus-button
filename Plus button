@@ -3,7 +3,7 @@
 //|        TradingView-style "+" price-axis button for pending orders |
 //+------------------------------------------------------------------+
 #property copyright "TV Quick Order EA"
-#property version   "1.01"
+#property version   "1.02"
 #property description "Hover the chart: a '+' button follows the cursor on the price axis."
 #property description "Click '+' to open a small menu with the valid pending order types"
 #property description "(Buy Stop / Sell Limit above price, Sell Stop / Buy Limit below price)."
@@ -15,7 +15,7 @@
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
 input group "=== Trade settings ==="
-input double LotSize         = 0.01;            // Lot size
+input double LotSize         = 0.01;            // Initial lot size (then editable in the on-chart Lots box)
 input int    StopLoss_Pips   = 100;             // Stop Loss in pips (0 = disabled)
 input int    TakeProfit_Pips = 200;             // Take Profit in pips (0 = disabled)
 input ulong  MagicNumber     = 20250101;        // Magic number
@@ -28,6 +28,7 @@ input int    ButtonOffsetX   = 4;               // Gap between button and price 
 input int    MenuWidth       = 150;             // Menu button width (px)
 input int    MenuItemHeight  = 24;              // Menu button height (px)
 input bool   ShowLevelLine   = true;            // Draw dotted line at hovered price
+input bool   ShowLotBox      = true;            // Show editable "Lots" box (bottom-left of chart)
 input color  ButtonBgColor   = C'38,38,38';     // '+' background
 input color  ButtonBorder    = C'120,120,120';  // '+' border
 input color  ButtonIconColor = clrWhite;        // '+' icon colour
@@ -45,6 +46,8 @@ input color  SellColor       = C'242,54,69';    // Sell menu items
 #define NM_MENU0    "TVQO_Menu0"
 #define NM_MENU1    "TVQO_Menu1"
 #define NM_STATUS   "TVQO_Status"
+#define NM_LOTLBL   "TVQO_LotLabel"
+#define NM_LOTBOX   "TVQO_LotBox"
 
 //+------------------------------------------------------------------+
 //| Globals                                                          |
@@ -62,6 +65,7 @@ int             g_btnY          = 0;       // '+' button top-left Y
 ENUM_ORDER_TYPE g_menuType[2];             // order types offered by the open menu
 datetime        g_statusExpire  = 0;       // when the status message disappears
 uint            g_menuTick      = 0;       // GetTickCount() when the menu was opened
+double          g_lot           = 0.0;     // active lot size (edited via the Lots box)
 int             g_lastW         = 0;       // last known chart size (resize detection)
 int             g_lastH         = 0;
 
@@ -92,6 +96,11 @@ int OnInit()
 
    ObjectsDeleteAll(0, OBJ_PREFIX);          // clear leftovers from a previous run
    EventSetTimer(1);                         // used to expire status messages
+
+   // Active lot size: last value saved for this symbol, otherwise the input
+   g_lot = GlobalVariableCheck(LotKey()) ? GlobalVariableGet(LotKey()) : LotSize;
+   g_lot = NormalizeVolume(g_lot);
+   if(ShowLotBox) CreateLotBox();
 
    g_lastW = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
    g_lastH = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS, 0);
@@ -150,6 +159,10 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
 
       case CHARTEVENT_KEYDOWN:               // ESC closes the menu
          if(lparam == 27 && g_menuOpen) CloseMenu();
+         break;
+
+      case CHARTEVENT_OBJECT_ENDEDIT:        // Enter pressed in the Lots box
+         if(sparam == NM_LOTBOX) HandleLotEdit();
          break;
 
       case CHARTEVENT_CHART_CHANGE:          // resize etc.: menu position would be stale
@@ -396,7 +409,7 @@ bool PlaceOrder(const ENUM_ORDER_TYPE type, const double entry)
 
    const bool   isBuy    = (type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT);
    const double minDist  = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
-   const double volume   = NormalizeVolume(LotSize);
+   const double volume   = NormalizeVolume(g_lot);
    double sl = 0.0, tp = 0.0;
 
    // SL / TP distances are measured from the pending order price and
@@ -436,8 +449,8 @@ bool PlaceOrder(const ENUM_ORDER_TYPE type, const double entry)
    const uint rc = g_trade.ResultRetcode();
    if(sent && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
    {
-      ShowStatus(StringFormat("%s placed @ %s  (#%I64u)", OrderTypeName(type),
-                              DoubleToString(entry, _Digits), g_trade.ResultOrder()),
+      ShowStatus(StringFormat("%s %s lots placed @ %s  (#%I64u)", OrderTypeName(type),
+                              DoubleToString(volume, LotDigits()), DoubleToString(entry, _Digits), g_trade.ResultOrder()),
                  clrLimeGreen);
       return true;
    }
@@ -500,6 +513,73 @@ void ShowStatus(const string text, const color clr)
    ObjectSetString (0, NM_STATUS, OBJPROP_TEXT,  text);
    ObjectSetInteger(0, NM_STATUS, OBJPROP_COLOR, clr);
    g_statusExpire = TimeLocal() + 5;
+   ChartRedraw();
+}
+
+// Key used to remember the lot size per symbol between EA reloads
+string LotKey() { return "TVQO_Lot_" + _Symbol; }
+
+// Small "Lots" label + edit box in the bottom-left corner of the chart
+void CreateLotBox()
+{
+   ObjectCreate(0, NM_LOTLBL, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_CORNER,     CORNER_LEFT_LOWER);
+   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_ANCHOR,     ANCHOR_LEFT_LOWER);
+   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_XDISTANCE,  12);
+   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_YDISTANCE,  14);
+   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_COLOR,      LineColor);
+   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_FONTSIZE,   8);
+   ObjectSetString (0, NM_LOTLBL, OBJPROP_FONT,       "Arial");
+   ObjectSetString (0, NM_LOTLBL, OBJPROP_TEXT,       "Lots:");
+   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_SELECTABLE, false);
+   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_HIDDEN,     true);
+
+   ObjectCreate(0, NM_LOTBOX, OBJ_EDIT, 0, 0, 0);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_CORNER,      CORNER_LEFT_LOWER);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_XDISTANCE,   52);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_YDISTANCE,   30);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_XSIZE,       70);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_YSIZE,       30);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_BGCOLOR,     ButtonBgColor);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_COLOR,       ButtonIconColor);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_BORDER_COLOR,ButtonBorder);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_FONTSIZE,    10);
+   ObjectSetString (0, NM_LOTBOX, OBJPROP_FONT,        "Arial");
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_ALIGN,       ALIGN_CENTER);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_READONLY,    false);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_SELECTABLE,  false);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_HIDDEN,      true);
+   ObjectSetString (0, NM_LOTBOX, OBJPROP_TOOLTIP,     "Lot size for quick orders (type a value, press Enter)");
+   ObjectSetString (0, NM_LOTBOX, OBJPROP_TEXT,        DoubleToString(g_lot, LotDigits()));
+}
+
+// Number of decimals needed to display the broker's volume step
+int LotDigits()
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(step <= 0.0) step = 0.01;
+   return (int)MathMax(0.0, MathRound(-MathLog10(step)));
+}
+
+// User typed a new lot size and pressed Enter
+void HandleLotEdit()
+{
+   string txt = ObjectGetString(0, NM_LOTBOX, OBJPROP_TEXT);
+   StringReplace(txt, ",", ".");                       // accept 0,10 as well as 0.10
+   const double typed = StringToDouble(txt);
+
+   if(typed <= 0.0)
+   {
+      ShowStatus("Invalid lot size - keeping " + DoubleToString(g_lot, LotDigits()), clrOrange);
+   }
+   else
+   {
+      g_lot = NormalizeVolume(typed);                  // clamp to broker min/max/step
+      GlobalVariableSet(LotKey(), g_lot);
+      if(MathAbs(g_lot - typed) > 1e-8)
+         ShowStatus("Lot size adjusted to " + DoubleToString(g_lot, LotDigits()) + " (broker limits)", clrOrange);
+   }
+   ObjectSetString(0, NM_LOTBOX, OBJPROP_TEXT, DoubleToString(g_lot, LotDigits()));
    ChartRedraw();
 }
 
