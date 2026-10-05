@@ -3,7 +3,7 @@
 //|        TradingView-style "+" price-axis button for pending orders |
 //+------------------------------------------------------------------+
 #property copyright "TV Quick Order EA"
-#property version   "1.02"
+#property version   "1.03"
 #property description "Hover the chart: a '+' button follows the cursor on the price axis."
 #property description "Click '+' to open a small menu with the valid pending order types"
 #property description "(Buy Stop / Sell Limit above price, Sell Stop / Buy Limit below price)."
@@ -16,8 +16,9 @@
 //+------------------------------------------------------------------+
 input group "=== Trade settings ==="
 input double LotSize         = 0.01;            // Initial lot size (then editable in the on-chart Lots box)
-input int    StopLoss_Pips   = 100;             // Stop Loss in pips (0 = disabled)
-input int    TakeProfit_Pips = 200;             // Take Profit in pips (0 = disabled)
+input double LotStepButton   = 0.01;            // Step used by the lot arrows (>= broker volume step)
+input int    StopLoss_Pips   = 200;             // Stop Loss in pips (0 = disabled)
+input int    TakeProfit_Pips = 2000;             // Take Profit in pips (0 = disabled)
 input ulong  MagicNumber     = 20250101;        // Magic number
 input ulong  Slippage        = 10;              // Max slippage / deviation (points)
 input string EA_Comment      = "TV Quick Order";// Order comment
@@ -25,7 +26,7 @@ input string EA_Comment      = "TV Quick Order";// Order comment
 input group "=== Appearance ==="
 input int    ButtonSize      = 22;              // '+' button size (px)
 input int    ButtonOffsetX   = 4;               // Gap between button and price axis (px)
-input int    MenuWidth       = 150;             // Menu button width (px)
+input int    MenuWidth       = 200;             // Menu button width (px)
 input int    MenuItemHeight  = 24;              // Menu button height (px)
 input bool   ShowLevelLine   = true;            // Draw dotted line at hovered price
 input bool   ShowLotBox      = true;            // Show editable "Lots" box (bottom-left of chart)
@@ -48,6 +49,8 @@ input color  SellColor       = C'242,54,69';    // Sell menu items
 #define NM_STATUS   "TVQO_Status"
 #define NM_LOTLBL   "TVQO_LotLabel"
 #define NM_LOTBOX   "TVQO_LotBox"
+#define NM_LOTDN    "TVQO_LotDown"
+#define NM_LOTUP    "TVQO_LotUp"
 
 //+------------------------------------------------------------------+
 //| Globals                                                          |
@@ -236,6 +239,13 @@ void HandleMouseMove(const int x, const int y, const uint state)
 //+------------------------------------------------------------------+
 void HandleObjectClick(const string name)
 {
+   if(name == NM_LOTDN || name == NM_LOTUP)
+   {
+      ObjectSetInteger(0, name, OBJPROP_STATE, false);   // un-press the button
+      StepLot(name == NM_LOTUP ? +1 : -1);
+      return;
+   }
+
    if(name == NM_PLUS)
    {
       ObjectSetInteger(0, NM_PLUS, OBJPROP_STATE, false);   // un-press the button
@@ -528,7 +538,7 @@ void CreateLotBox()
    ObjectSetInteger(0, NM_LOTLBL, OBJPROP_XDISTANCE,  12);
    ObjectSetInteger(0, NM_LOTLBL, OBJPROP_YDISTANCE,  14);
    ObjectSetInteger(0, NM_LOTLBL, OBJPROP_COLOR,      LineColor);
-   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_FONTSIZE,   8);
+   ObjectSetInteger(0, NM_LOTLBL, OBJPROP_FONTSIZE,   9);
    ObjectSetString (0, NM_LOTLBL, OBJPROP_FONT,       "Arial");
    ObjectSetString (0, NM_LOTLBL, OBJPROP_TEXT,       "Lots:");
    ObjectSetInteger(0, NM_LOTLBL, OBJPROP_SELECTABLE, false);
@@ -536,7 +546,7 @@ void CreateLotBox()
 
    ObjectCreate(0, NM_LOTBOX, OBJ_EDIT, 0, 0, 0);
    ObjectSetInteger(0, NM_LOTBOX, OBJPROP_CORNER,      CORNER_LEFT_LOWER);
-   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_XDISTANCE,   52);
+   ObjectSetInteger(0, NM_LOTBOX, OBJPROP_XDISTANCE,   72);
    ObjectSetInteger(0, NM_LOTBOX, OBJPROP_YDISTANCE,   30);
    ObjectSetInteger(0, NM_LOTBOX, OBJPROP_XSIZE,       70);
    ObjectSetInteger(0, NM_LOTBOX, OBJPROP_YSIZE,       30);
@@ -551,6 +561,54 @@ void CreateLotBox()
    ObjectSetInteger(0, NM_LOTBOX, OBJPROP_HIDDEN,      true);
    ObjectSetString (0, NM_LOTBOX, OBJPROP_TOOLTIP,     "Lot size for quick orders (type a value, press Enter)");
    ObjectSetString (0, NM_LOTBOX, OBJPROP_TEXT,        DoubleToString(g_lot, LotDigits()));
+
+   // Down arrow (left of the box) and up arrow (right of the box)
+   CreateLotArrow(NM_LOTDN, ShortToString(0x25BC),  48, "Decrease lot size");
+   CreateLotArrow(NM_LOTUP, ShortToString(0x25B2), 144, "Increase lot size");
+}
+
+// Small square arrow button in the bottom-left corner area
+void CreateLotArrow(const string name, const string glyph, const int x, const string tip)
+{
+   ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_CORNER,      CORNER_LEFT_LOWER);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,   30);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,       30);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,       30);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     ButtonBgColor);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,       ButtonIconColor);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR,ButtonBorder);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,    8);
+   ObjectSetString (0, name, OBJPROP_FONT,        "Arial");
+   ObjectSetString (0, name, OBJPROP_TEXT,        glyph);
+   ObjectSetString (0, name, OBJPROP_TOOLTIP,     tip);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,  false);
+   ObjectSetInteger(0, name, OBJPROP_HIDDEN,      true);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER,      10);
+   ObjectSetInteger(0, name, OBJPROP_STATE,       false);
+}
+
+// Arrow click: change the lot size by one step (dir = +1 up, -1 down)
+void StepLot(const int dir)
+{
+   double bstep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(bstep <= 0.0) bstep = 0.01;
+   const double step = MathMax(LotStepButton, bstep);
+
+   double target = g_lot + dir * step;
+   target = MathRound(target / bstep) * bstep;          // avoid float drift (0.07 + 0.01)
+   const double newLot = NormalizeVolume(target);      // clamp to broker min / max
+
+   if(MathAbs(newLot - g_lot) < 1e-8)
+      ShowStatus(dir > 0 ? "Maximum lot size reached" : "Minimum lot size reached", clrOrange);
+   else
+   {
+      g_lot = newLot;
+      GlobalVariableSet(LotKey(), g_lot);
+   }
+   ObjectSetString(0, NM_LOTBOX, OBJPROP_TEXT, DoubleToString(g_lot, LotDigits()));
+   ChartRedraw();
 }
 
 // Number of decimals needed to display the broker's volume step
