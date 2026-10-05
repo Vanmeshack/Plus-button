@@ -1,0 +1,564 @@
+//+------------------------------------------------------------------+
+//|                                                TV_QuickOrder.mq5 |
+//|        TradingView-style "+" price-axis button for pending orders |
+//+------------------------------------------------------------------+
+#property copyright "TV Quick Order EA"
+#property version   "1.01"
+#property description "Hover the chart: a '+' button follows the cursor on the price axis."
+#property description "Click '+' to open a small menu with the valid pending order types"
+#property description "(Buy Stop / Sell Limit above price, Sell Stop / Buy Limit below price)."
+#property description "Press ESC or click the chart to dismiss the menu."
+
+#include <Trade\Trade.mqh>
+
+//+------------------------------------------------------------------+
+//| Inputs                                                           |
+//+------------------------------------------------------------------+
+input group "=== Trade settings ==="
+input double LotSize         = 0.01;            // Lot size
+input int    StopLoss_Pips   = 100;             // Stop Loss in pips (0 = disabled)
+input int    TakeProfit_Pips = 200;             // Take Profit in pips (0 = disabled)
+input ulong  MagicNumber     = 20250101;        // Magic number
+input ulong  Slippage        = 10;              // Max slippage / deviation (points)
+input string EA_Comment      = "TV Quick Order";// Order comment
+
+input group "=== Appearance ==="
+input int    ButtonSize      = 22;              // '+' button size (px)
+input int    ButtonOffsetX   = 4;               // Gap between button and price axis (px)
+input int    MenuWidth       = 150;             // Menu button width (px)
+input int    MenuItemHeight  = 24;              // Menu button height (px)
+input bool   ShowLevelLine   = true;            // Draw dotted line at hovered price
+input color  ButtonBgColor   = C'38,38,38';     // '+' background
+input color  ButtonBorder    = C'120,120,120';  // '+' border
+input color  ButtonIconColor = clrWhite;        // '+' icon colour
+input color  LineColor       = clrSilver;       // Hover line / price tag colour
+input color  BuyColor        = C'8,153,129';    // Buy menu items
+input color  SellColor       = C'242,54,69';    // Sell menu items
+
+//+------------------------------------------------------------------+
+//| Object names (all share the TVQO_ prefix for easy cleanup)       |
+//+------------------------------------------------------------------+
+#define OBJ_PREFIX  "TVQO_"
+#define NM_PLUS     "TVQO_Plus"
+#define NM_LINE     "TVQO_Line"
+#define NM_TAG      "TVQO_PriceTag"
+#define NM_MENU0    "TVQO_Menu0"
+#define NM_MENU1    "TVQO_Menu1"
+#define NM_STATUS   "TVQO_Status"
+
+//+------------------------------------------------------------------+
+//| Globals                                                          |
+//+------------------------------------------------------------------+
+CTrade          g_trade;
+double          g_pip           = 0.0;     // pip size in price units
+bool            g_prevMouseFlag = false;   // original CHART_EVENT_MOUSE_MOVE value
+
+bool            g_uiVisible     = false;   // '+' button currently shown
+bool            g_menuOpen      = false;   // order menu currently shown
+double          g_levelPrice    = 0.0;     // price under the cursor (updated on hover)
+double          g_menuPrice     = 0.0;     // price frozen when the menu was opened
+int             g_btnX          = 0;       // '+' button top-left X
+int             g_btnY          = 0;       // '+' button top-left Y
+ENUM_ORDER_TYPE g_menuType[2];             // order types offered by the open menu
+datetime        g_statusExpire  = 0;       // when the status message disappears
+uint            g_menuTick      = 0;       // GetTickCount() when the menu was opened
+int             g_lastW         = 0;       // last known chart size (resize detection)
+int             g_lastH         = 0;
+
+//+------------------------------------------------------------------+
+//| Expert initialisation                                            |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   if(LotSize <= 0.0 || StopLoss_Pips < 0 || TakeProfit_Pips < 0)
+   {
+      Print("TV_QuickOrder: invalid input parameters.");
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
+   // Pip size: 5/3-digit symbols use 10 points per pip, others 1 point
+   const int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   g_pip = (digits == 3 || digits == 5) ? _Point * 10.0 : _Point;
+
+   // CTrade configuration
+   g_trade.SetExpertMagicNumber(MagicNumber);
+   g_trade.SetDeviationInPoints(Slippage);
+   g_trade.SetTypeFillingBySymbol(_Symbol);
+   g_trade.SetAsyncMode(false);
+
+   // Enable mouse-move events (remember the previous state to restore it later)
+   g_prevMouseFlag = (bool)ChartGetInteger(0, CHART_EVENT_MOUSE_MOVE);
+   ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, true);
+
+   ObjectsDeleteAll(0, OBJ_PREFIX);          // clear leftovers from a previous run
+   EventSetTimer(1);                         // used to expire status messages
+
+   g_lastW = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+   g_lastH = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS, 0);
+
+   ChartRedraw();
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| Expert deinitialisation - remove every object we created         |
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   EventKillTimer();
+   ObjectsDeleteAll(0, OBJ_PREFIX);
+   ChartSetInteger(0, CHART_EVENT_MOUSE_MOVE, g_prevMouseFlag);
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Tick handler (not needed - the EA is fully event driven)         |
+//+------------------------------------------------------------------+
+void OnTick() { }
+
+//+------------------------------------------------------------------+
+//| Timer: removes the status message after it has expired           |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   if(g_statusExpire > 0 && TimeLocal() >= g_statusExpire)
+   {
+      ObjectDelete(0, NM_STATUS);
+      g_statusExpire = 0;
+      ChartRedraw();
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Chart events                                                     |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   switch(id)
+   {
+      case CHARTEVENT_MOUSE_MOVE:
+         HandleMouseMove((int)lparam, (int)dparam, (uint)StringToInteger(sparam));
+         break;
+
+      case CHARTEVENT_OBJECT_CLICK:
+         HandleObjectClick(sparam);
+         break;
+
+      case CHARTEVENT_CLICK:                 // click on the chart (x = lparam, y = dparam)
+         HandleChartClick((int)lparam, (int)dparam);
+         break;
+
+      case CHARTEVENT_KEYDOWN:               // ESC closes the menu
+         if(lparam == 27 && g_menuOpen) CloseMenu();
+         break;
+
+      case CHARTEVENT_CHART_CHANGE:          // resize etc.: menu position would be stale
+      {
+         const int w = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+         const int h = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS, 0);
+         if((w != g_lastW || h != g_lastH) && g_menuOpen) CloseMenu();
+         g_lastW = w;
+         g_lastH = h;
+         break;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Mouse move: move the '+' button / hover line to the cursor price |
+//+------------------------------------------------------------------+
+void HandleMouseMove(const int x, const int y, const uint state)
+{
+   // While the menu is open everything stays frozen
+   if(g_menuOpen) return;
+
+   // A mouse button is held down
+   if((state & (1 | 2 | 16)) != 0)
+   {
+      // Pressed while over the '+' button = a click is in progress. Leave the
+      // button untouched, otherwise moving it would swallow the click.
+      if(g_uiVisible &&
+         x >= g_btnX && x <= g_btnX + ButtonSize &&
+         y >= g_btnY && y <= g_btnY + ButtonSize)
+         return;
+
+      // Pressed elsewhere = chart dragging / scrolling: hide the UI
+      HideUI();
+      return;
+   }
+
+   const int chartW = (int)ChartGetInteger(0, CHART_WIDTH_IN_PIXELS);
+   const int chartH = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS, 0);
+
+   // The cursor may be over the price scale (x > plot width); clamp X so the
+   // Y -> price conversion still works there.
+   const int cx = MathMax(0, MathMin(x, chartW - 1));
+
+   int      subWindow = 0;
+   datetime time      = 0;
+   double   price     = 0.0;
+   if(!ChartXYToTimePrice(0, cx, y, subWindow, time, price) || subWindow != 0)
+   {
+      HideUI();                               // outside the main price window
+      return;
+   }
+
+   const double newLevel = NormalizePrice(price);
+   const int    newX     = chartW - ButtonSize - ButtonOffsetX;
+   const int    newY     = MathMax(0, MathMin(y - ButtonSize / 2, chartH - ButtonSize));
+
+   // Nothing moved: avoid needless object updates / redraws
+   if(g_uiVisible && newLevel == g_levelPrice && newX == g_btnX && newY == g_btnY)
+      return;
+
+   g_levelPrice = newLevel;
+   g_btnX = newX;
+   g_btnY = newY;
+
+   ShowUI();
+}
+
+//+------------------------------------------------------------------+
+//| Object clicks: '+' button and menu items                         |
+//+------------------------------------------------------------------+
+void HandleObjectClick(const string name)
+{
+   if(name == NM_PLUS)
+   {
+      ObjectSetInteger(0, NM_PLUS, OBJPROP_STATE, false);   // un-press the button
+      if(g_menuOpen) CloseMenu();
+      else           OpenMenu();
+      return;
+   }
+
+   if(name == NM_MENU0 || name == NM_MENU1)
+   {
+      const int             idx   = (name == NM_MENU0) ? 0 : 1;
+      const ENUM_ORDER_TYPE type  = g_menuType[idx];
+      const double          price = g_menuPrice;
+      CloseMenu();                                            // clean UI first
+      PlaceOrder(type, price);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Show / update '+' button, hover line and price tag               |
+//+------------------------------------------------------------------+
+void ShowUI()
+{
+   const int centerY = g_btnY + ButtonSize / 2;
+
+   // '+' button
+   EnsureButton(NM_PLUS, "+", g_btnX, g_btnY, ButtonSize, ButtonSize,
+                ButtonBgColor, ButtonIconColor, ButtonBorder, 12, "Add order at this price");
+
+   // Dotted horizontal line at the hovered price
+   if(ShowLevelLine)
+   {
+      if(ObjectFind(0, NM_LINE) < 0)
+      {
+         ObjectCreate(0, NM_LINE, OBJ_HLINE, 0, 0, g_levelPrice);
+         ObjectSetInteger(0, NM_LINE, OBJPROP_COLOR,      LineColor);
+         ObjectSetInteger(0, NM_LINE, OBJPROP_STYLE,      STYLE_DOT);
+         ObjectSetInteger(0, NM_LINE, OBJPROP_WIDTH,      1);
+         ObjectSetInteger(0, NM_LINE, OBJPROP_BACK,       true);
+         ObjectSetInteger(0, NM_LINE, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, NM_LINE, OBJPROP_HIDDEN,     true);
+         ObjectSetString (0, NM_LINE, OBJPROP_TOOLTIP,    "\n");
+      }
+      ObjectMove(0, NM_LINE, 0, 0, g_levelPrice);
+   }
+
+   // Price tag left of the button (hidden while the menu is open)
+   if(!g_menuOpen)
+   {
+      if(ObjectFind(0, NM_TAG) < 0)
+      {
+         ObjectCreate(0, NM_TAG, OBJ_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, NM_TAG, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
+         ObjectSetInteger(0, NM_TAG, OBJPROP_ANCHOR,     ANCHOR_RIGHT);
+         ObjectSetInteger(0, NM_TAG, OBJPROP_COLOR,      LineColor);
+         ObjectSetInteger(0, NM_TAG, OBJPROP_FONTSIZE,   9);
+         ObjectSetString (0, NM_TAG, OBJPROP_FONT,       "Arial");
+         ObjectSetInteger(0, NM_TAG, OBJPROP_SELECTABLE, false);
+         ObjectSetInteger(0, NM_TAG, OBJPROP_HIDDEN,     true);
+         ObjectSetString (0, NM_TAG, OBJPROP_TOOLTIP,    "\n");
+      }
+      ObjectSetInteger(0, NM_TAG, OBJPROP_XDISTANCE, g_btnX - 6);
+      ObjectSetInteger(0, NM_TAG, OBJPROP_YDISTANCE, centerY);
+      ObjectSetString (0, NM_TAG, OBJPROP_TEXT, DoubleToString(g_levelPrice, _Digits));
+   }
+
+   g_uiVisible = true;
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Remove '+' button, hover line and price tag                      |
+//+------------------------------------------------------------------+
+void HideUI()
+{
+   if(!g_uiVisible) return;
+   ObjectDelete(0, NM_PLUS);
+   ObjectDelete(0, NM_LINE);
+   ObjectDelete(0, NM_TAG);
+   g_uiVisible = false;
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Open the order menu for the currently hovered price              |
+//+------------------------------------------------------------------+
+void OpenMenu()
+{
+   const double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   const double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   const double minDist = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   const double eps = _Point * 0.5;
+   const double p   = g_levelPrice;
+
+   if(p > ask && p >= ask + minDist - eps)
+   {
+      // Above market: Buy Stop / Sell Limit
+      g_menuType[0] = ORDER_TYPE_BUY_STOP;
+      g_menuType[1] = ORDER_TYPE_SELL_LIMIT;
+   }
+   else if(p < bid && p <= bid - minDist + eps)
+   {
+      // Below market: Sell Stop / Buy Limit
+      g_menuType[0] = ORDER_TYPE_SELL_STOP;
+      g_menuType[1] = ORDER_TYPE_BUY_LIMIT;
+   }
+   else
+   {
+      ShowStatus(StringFormat("Level too close to market (min distance %d points)",
+                              (int)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL)),
+                 clrOrange);
+      return;
+   }
+
+   g_menuPrice = p;
+   g_menuOpen  = true;
+   g_menuTick  = GetTickCount();
+   ObjectDelete(0, NM_TAG);                  // menu text already shows the price
+   BuildMenu();
+   ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Create the two menu buttons next to the '+' button               |
+//+------------------------------------------------------------------+
+void BuildMenu()
+{
+   const int chartH = (int)ChartGetInteger(0, CHART_HEIGHT_IN_PIXELS, 0);
+   const int h      = MenuItemHeight;
+   const int totalH = 2 * h + 2;
+
+   const int mx = MathMax(2, g_btnX - MenuWidth - 4);
+   int my = g_btnY + ButtonSize / 2 - totalH / 2;        // centred on the level
+   my = MathMax(2, MathMin(my, chartH - totalH - 2));    // keep inside the chart
+
+   for(int i = 0; i < 2; i++)
+   {
+      const ENUM_ORDER_TYPE t = g_menuType[i];
+      const bool isBuy = (t == ORDER_TYPE_BUY_STOP || t == ORDER_TYPE_BUY_LIMIT);
+      const string text = OrderTypeName(t) + "  @ " + DoubleToString(g_menuPrice, _Digits);
+
+      EnsureButton(i == 0 ? NM_MENU0 : NM_MENU1, text,
+                   mx, my + i * (h + 2), MenuWidth, h,
+                   isBuy ? BuyColor : SellColor, clrWhite, ButtonBorder, 9,
+                   "Place " + OrderTypeName(t));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Close the menu and restore the normal hover UI                   |
+//+------------------------------------------------------------------+
+void CloseMenu()
+{
+   ObjectDelete(0, NM_MENU0);
+   ObjectDelete(0, NM_MENU1);
+   g_menuOpen = false;
+   if(g_uiVisible) ShowUI();                 // brings back the price tag and redraws
+   else            ChartRedraw();
+}
+
+//+------------------------------------------------------------------+
+//| Place the pending order at the chosen price                      |
+//+------------------------------------------------------------------+
+bool PlaceOrder(const ENUM_ORDER_TYPE type, const double entry)
+{
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED))
+   {
+      ShowStatus("Trading not allowed - enable Algo Trading", clrOrangeRed);
+      return false;
+   }
+
+   const bool   isBuy    = (type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_LIMIT);
+   const double minDist  = (double)SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+   const double volume   = NormalizeVolume(LotSize);
+   double sl = 0.0, tp = 0.0;
+
+   // SL / TP distances are measured from the pending order price and
+   // pushed out to the broker's minimum stop level if necessary.
+   if(StopLoss_Pips > 0)
+   {
+      const double d = MathMax(StopLoss_Pips * g_pip, minDist + _Point);
+      sl = NormalizePrice(isBuy ? entry - d : entry + d);
+      if(sl <= 0.0) sl = 0.0;
+   }
+   if(TakeProfit_Pips > 0)
+   {
+      const double d = MathMax(TakeProfit_Pips * g_pip, minDist + _Point);
+      tp = NormalizePrice(isBuy ? entry + d : entry - d);
+      if(tp <= 0.0) tp = 0.0;
+   }
+
+   bool sent = false;
+   switch(type)
+   {
+      case ORDER_TYPE_BUY_STOP:
+         sent = g_trade.BuyStop(volume, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, EA_Comment);
+         break;
+      case ORDER_TYPE_BUY_LIMIT:
+         sent = g_trade.BuyLimit(volume, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, EA_Comment);
+         break;
+      case ORDER_TYPE_SELL_STOP:
+         sent = g_trade.SellStop(volume, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, EA_Comment);
+         break;
+      case ORDER_TYPE_SELL_LIMIT:
+         sent = g_trade.SellLimit(volume, entry, _Symbol, sl, tp, ORDER_TIME_GTC, 0, EA_Comment);
+         break;
+      default:
+         return false;
+   }
+
+   const uint rc = g_trade.ResultRetcode();
+   if(sent && (rc == TRADE_RETCODE_DONE || rc == TRADE_RETCODE_PLACED))
+   {
+      ShowStatus(StringFormat("%s placed @ %s  (#%I64u)", OrderTypeName(type),
+                              DoubleToString(entry, _Digits), g_trade.ResultOrder()),
+                 clrLimeGreen);
+      return true;
+   }
+
+   ShowStatus(StringFormat("%s failed: %s (%u)", OrderTypeName(type),
+                           g_trade.ResultRetcodeDescription(), rc), clrOrangeRed);
+   PrintFormat("TV_QuickOrder: %s @ %s failed, retcode=%u (%s)", OrderTypeName(type),
+               DoubleToString(entry, _Digits), rc, g_trade.ResultRetcodeDescription());
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Helpers                                                          |
+//+------------------------------------------------------------------+
+
+// Create (once) and update a styled button
+void EnsureButton(const string name, const string text,
+                  const int x, const int y, const int w, const int h,
+                  const color bg, const color fg, const color border,
+                  const int fontSize, const string tooltip)
+{
+   if(ObjectFind(0, name) < 0)
+   {
+      ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+      ObjectSetInteger(0, name, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_SELECTED,   false);
+      ObjectSetInteger(0, name, OBJPROP_HIDDEN,     true);
+      ObjectSetInteger(0, name, OBJPROP_ZORDER,     10);   // above lines/labels
+      ObjectSetString (0, name, OBJPROP_FONT,       "Arial Bold");
+   }
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,   x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,   y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,       w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,       h);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,     bg);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,       fg);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR,border);
+   ObjectSetInteger(0, name, OBJPROP_FONTSIZE,    fontSize);
+   ObjectSetInteger(0, name, OBJPROP_STATE,       false);
+   ObjectSetString (0, name, OBJPROP_TEXT,        text);
+   ObjectSetString (0, name, OBJPROP_TOOLTIP,     tooltip);
+}
+
+// Short-lived message in the top-left corner of the chart
+void ShowStatus(const string text, const color clr)
+{
+   if(ObjectFind(0, NM_STATUS) < 0)
+   {
+      ObjectCreate(0, NM_STATUS, OBJ_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, NM_STATUS, OBJPROP_CORNER,     CORNER_LEFT_UPPER);
+      ObjectSetInteger(0, NM_STATUS, OBJPROP_ANCHOR,     ANCHOR_LEFT_UPPER);
+      ObjectSetInteger(0, NM_STATUS, OBJPROP_XDISTANCE,  12);
+      ObjectSetInteger(0, NM_STATUS, OBJPROP_YDISTANCE,  24);
+      ObjectSetInteger(0, NM_STATUS, OBJPROP_FONTSIZE,   10);
+      ObjectSetString (0, NM_STATUS, OBJPROP_FONT,       "Arial");
+      ObjectSetInteger(0, NM_STATUS, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, NM_STATUS, OBJPROP_HIDDEN,     true);
+   }
+   ObjectSetString (0, NM_STATUS, OBJPROP_TEXT,  text);
+   ObjectSetInteger(0, NM_STATUS, OBJPROP_COLOR, clr);
+   g_statusExpire = TimeLocal() + 5;
+   ChartRedraw();
+}
+
+// True if the point (x, y) lies inside the named object's rectangle
+bool PointInObject(const string name, const int x, const int y)
+{
+   if(ObjectFind(0, name) < 0) return false;
+   const int ox = (int)ObjectGetInteger(0, name, OBJPROP_XDISTANCE);
+   const int oy = (int)ObjectGetInteger(0, name, OBJPROP_YDISTANCE);
+   const int ow = (int)ObjectGetInteger(0, name, OBJPROP_XSIZE);
+   const int oh = (int)ObjectGetInteger(0, name, OBJPROP_YSIZE);
+   return (x >= ox && x <= ox + ow && y >= oy && y <= oy + oh);
+}
+
+// Click on the chart: dismiss the menu, but ignore clicks that belong to our
+// own buttons (MT5 may raise CHARTEVENT_CLICK in addition to the object click,
+// which would otherwise close the menu the instant it opens).
+void HandleChartClick(const int x, const int y)
+{
+   if(!g_menuOpen) return;
+   if(GetTickCount() - g_menuTick < 300) return;       // just opened: ignore
+   if(PointInObject(NM_PLUS,  x, y) ||
+      PointInObject(NM_MENU0, x, y) ||
+      PointInObject(NM_MENU1, x, y))
+      return;
+   CloseMenu();
+}
+
+// Snap a price to the symbol's tick size
+double NormalizePrice(const double price)
+{
+   double tick = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tick <= 0.0) tick = _Point;
+   return NormalizeDouble(MathRound(price / tick) * tick, _Digits);
+}
+
+// Clamp lots to broker min/max and round down to the volume step
+double NormalizeVolume(double lots)
+{
+   double step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   const double vmin = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   const double vmax = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   if(step <= 0.0) step = 0.01;
+
+   lots = MathFloor(lots / step + 1e-8) * step;
+   lots = MathMax(vmin, MathMin(vmax, lots));
+   const int volDigits = (int)MathMax(0.0, MathRound(-MathLog10(step)));
+   return NormalizeDouble(lots, volDigits);
+}
+
+string OrderTypeName(const ENUM_ORDER_TYPE t)
+{
+   switch(t)
+   {
+      case ORDER_TYPE_BUY_STOP:   return "Buy Stop";
+      case ORDER_TYPE_BUY_LIMIT:  return "Buy Limit";
+      case ORDER_TYPE_SELL_STOP:  return "Sell Stop";
+      case ORDER_TYPE_SELL_LIMIT: return "Sell Limit";
+   }
+   return "Order";
+}
+//+------------------------------------------------------------------+
